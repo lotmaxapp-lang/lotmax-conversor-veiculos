@@ -4,6 +4,7 @@ import io
 import os
 import re
 import uuid
+import unicodedata
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from openpyxl import load_workbook
 app = FastAPI(
     title="Lotmax - Conversor de Veículos",
     description="Recebe Excel, converte para CSV e disponibiliza uma URL para o Bubble.",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 UPLOAD_DIR = Path(os.environ.get("LOTMAX_UPLOAD_DIR", "/tmp/lotmax-veiculos"))
@@ -22,7 +23,6 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 
-# Campos numéricos e seus tipos no Bubble.
 INTEGER_FIELDS = {"11-Locacao_$"}
 DECIMAL_FIELDS = {"11-Locacao_CFD"}
 
@@ -32,9 +32,16 @@ def health_check():
     return {
         "status": "ok",
         "service": "lotmax-conversor-veiculos",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "message": "Serviço ativo. Envie um Excel para POST /veiculos."
     }
+
+
+def normalizar_cabecalho(valor):
+    texto = str(valor or "").strip().lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return texto
 
 
 def normalizar_numero(valor, campo):
@@ -46,7 +53,6 @@ def normalizar_numero(valor, campo):
 
     texto = str(valor).strip().replace("R$", "").replace(" ", "")
 
-    # Converte números brasileiros, por exemplo 2.500,00.
     if "," in texto:
         texto = texto.replace(".", "").replace(",", ".")
 
@@ -76,9 +82,9 @@ async def receber_excel_veiculos(
     file: UploadFile = File(...)
 ):
     original_name = file.filename or "veiculos.xlsx"
-    extensao = Path(original_name).suffix.lower()
 
-    if extensao != ".xlsx":
+    if Path(original_name).suffix.lower() != ".xlsx":
+        await file.close()
         raise HTTPException(
             status_code=400,
             detail="Envie uma planilha Excel no formato .xlsx."
@@ -96,6 +102,8 @@ async def receber_excel_veiculos(
             detail="O arquivo excede o limite de 20 MB."
         )
 
+    workbook = None
+
     try:
         workbook = load_workbook(
             io.BytesIO(conteudo),
@@ -105,19 +113,36 @@ async def receber_excel_veiculos(
 
         worksheet = workbook.active
         linhas = worksheet.iter_rows(values_only=True)
+        cabecalhos_originais = next(linhas, None)
 
-        cabecalhos = next(linhas, None)
-
-        if not cabecalhos:
+        if not cabecalhos_originais:
             raise ValueError("A planilha não contém cabeçalhos.")
 
         cabecalhos = [
             str(valor).strip() if valor is not None else ""
-            for valor in cabecalhos
+            for valor in cabecalhos_originais
+        ]
+
+        cabecalhos_normalizados = [
+            normalizar_cabecalho(campo) for campo in cabecalhos
         ]
 
         if not any(cabecalhos):
             raise ValueError("A primeira linha está vazia.")
+
+        # Localiza a coluna Placa, inclusive cabeçalhos como 01-Placa.
+        indices_placa = [
+            indice
+            for indice, campo in enumerate(cabecalhos_normalizados)
+            if campo == "placa" or campo.endswith("-placa")
+        ]
+
+        if not indices_placa:
+            raise ValueError(
+                "A coluna Placa não foi encontrada nos cabeçalhos."
+            )
+
+        indice_placa = indices_placa[0]
 
         saida = io.StringIO(newline="")
         escritor = csv.writer(
@@ -129,16 +154,19 @@ async def receber_excel_veiculos(
         escritor.writerow(cabecalhos)
 
         quantidade_linhas = 0
+        linhas_descartadas = 0
 
         for numero_linha, linha in enumerate(linhas, start=2):
-            if not any(
-                valor is not None and str(valor).strip() != ""
-                for valor in linha
-            ):
-                continue
-
             valores = list(linha[:len(cabecalhos)])
             valores += [""] * (len(cabecalhos) - len(valores))
+
+            # REGRA PRINCIPAL:
+            # sem placa, a linha não é um registro de veículo.
+            placa = valores[indice_placa]
+
+            if placa is None or str(placa).strip() == "":
+                linhas_descartadas += 1
+                continue
 
             linha_csv = []
 
@@ -153,10 +181,13 @@ async def receber_excel_veiculos(
 
                 elif valor is None:
                     valor = ""
+
                 elif hasattr(valor, "isoformat"):
-                    valor = valor.isoformat(sep=" ") if hasattr(
-                        valor, "hour"
-                    ) else valor.isoformat()
+                    if hasattr(valor, "hour"):
+                        valor = valor.isoformat(sep=" ")
+                    else:
+                        valor = valor.isoformat()
+
                 else:
                     valor = str(valor)
 
@@ -165,23 +196,28 @@ async def receber_excel_veiculos(
             escritor.writerow(linha_csv)
             quantidade_linhas += 1
 
-        workbook.close()
-
         if quantidade_linhas == 0:
-            raise ValueError("A planilha não contém linhas de dados.")
+            raise ValueError(
+                "Nenhum veículo válido encontrado: todas as placas estão vazias."
+            )
 
         csv_bytes = saida.getvalue().encode("utf-8-sig")
         stored_name = f"{uuid.uuid4().hex}.csv"
         destination = UPLOAD_DIR / stored_name
         destination.write_bytes(csv_bytes)
 
-    except HTTPException:
-        raise
     except Exception as erro:
+        if isinstance(erro, HTTPException):
+            raise
+
         raise HTTPException(
             status_code=400,
             detail=f"Não foi possível converter o Excel: {erro}"
         )
+
+    finally:
+        if workbook is not None:
+            workbook.close()
 
     download_url = (
         str(request.base_url).rstrip("/")
@@ -194,8 +230,9 @@ async def receber_excel_veiculos(
         "csv_filename": "veiculos.csv",
         "size_bytes": len(csv_bytes),
         "rows": quantidade_linhas,
+        "rows_discarded": linhas_descartadas,
         "url": download_url,
-        "message": "Excel convertido em CSV com sucesso."
+        "message": "Excel convertido em CSV. Linhas sem placa foram descartadas."
     }
 
 
